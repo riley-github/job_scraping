@@ -29,6 +29,8 @@ TITLE_QUERY = [
     "fluids", "cfd", "fea", "gd&t", "cad", "design engineer", "systems engineer",
     "flight", "airframe", "rocket", "launch", "spacecraft", "combustion",
     "aeromechanical", "aerothermal", "rotating equipment", "test engineer",
+    "compressor", "turbocharger", "performance engineer", "hypersonic", "simulation engineer",
+    "cycle", "validation engineer", "development engineer",
 ]
 
 # Title keywords -> score. First tier = core fit.
@@ -37,6 +39,8 @@ TITLE_SCORES = {
     r"\b(turbine|jet engine|gas turbine|combustion|rotating equipment)\b": 4,
     r"\b(structures?|stress|airframe|thermal|fluids?|cfd|fea)\b": 3,
     r"\b(design engineer|cad|gd&t|test engineer|systems engineer|flight|rocket|launch|spacecraft)\b": 2,
+    r"\b(compressor|turbocharger|turbo|hot gas|turbine test|engine test|performance engineer|cycle)\b": 3,
+    r"\b(test|validation|development|simulation)\b.*\bengineer|\bengineer.*\b(test|validation|simulation)\b": 1,
     r"\bengineer\b": 1,
 }
 
@@ -45,7 +49,11 @@ DESC_SCORES = {
     r"turbomachinery": 3, r"jet engine|gas turbine|turbofan|turbojet": 3,
     r"propulsion": 2, r"aerospace|aircraft|spacecraft|satellite": 2,
     r"solidworks|catia|nx\b|creo|siemens nx": 1, r"gd&t|gdt": 1,
-    r"ansys|abaqus|nastran|fea\b|cfd\b": 1, r"stress analysis|structural analysis": 2,
+    r"ansys|abaqus|nastran|fea\b|cfd\b": 1,
+    r"compressor map|turbine map|hot gas|test stand|test cell|surge|performance map": 3,
+    r"matlab|python": 1, r"amesim|gt-?suite|simulink|1d (?:system )?model": 1,
+    r"additive manufacturing|slm|dmls|3d print": 1,
+    r"hypersonic|rocket|liquid engine|turbopump|combustor|afterburner|power generation": 2, r"stress analysis|structural analysis": 2,
 }
 
 # Known aerospace / defense / engine employers: small bonus (substring match).
@@ -56,7 +64,12 @@ COMPANY_BONUS = [
     "l3harris", "general dynamics", "bae systems", "textron", "gulfstream",
     "collins", "safran", "rolls-royce", "siemens energy", "solar turbines",
     "mitsubishi power", "baker hughes", "firefly", "united launch alliance", "stoke", "ursa major", "hermeus", "boom supersonic", "zero avia",
-    "nasa", "jacobs", "leidos", "sierra nevada", "aerojet",
+    "nasa", "jacobs", "leidos", "sierra nevada", "aerojet", "williams international", "howmet", "woodward", "elliott group",
+    "capstone", "hamilton sundstrand", "mtu aero", "kratos", "vast", "varda", "impulse space",
+    "true anomaly", "castelion", "radiant", "x-energy", "helion", "commonwealth fusion",
+    "venus aerospace", "saronic", "divergent", "ball aerospace", "bwxt", "ge vernova",
+    "ge aviation", "pratt & whitney", "abl space", "terran orbital", "intuitive machines",
+    "ast spacemobile", "skydweller", "wisk", "overair",
 ]
 
 # Titles to drop: too senior, or not a job-search target.
@@ -78,6 +91,25 @@ CLEARANCE_BLOCK = re.compile(
 CLEARANCE_OK = re.compile(
     r"(ability to obtain|able to obtain|eligib\w+ (?:for|to obtain)|can obtain|"
     r"willing(?:ness)? to obtain|obtain and maintain)", re.I)
+
+# You are leaving automotive: hard-exclude these employers and any automotive industry tag.
+AUTOMOTIVE_COMPANIES = [
+    "general motors", "gm ", "ford motor", "stellantis", "chrysler", "tesla", "rivian",
+    "lucid", "toyota", "honda", "nissan", "hyundai", "kia", "bmw", "mercedes", "volkswagen",
+    "audi", "volvo", "gm cruise", "cummins", "paccar", "navistar", "daimler truck",
+    "borgwarner", "garrett motion", "aptiv", "lear corp", "magna", "dana inc", "tenneco",
+    "bosch", "continental", "denso", "zf ", "allison transmission", "harley", "polaris",
+    "fisker", "polestar", "nikola", "lordstown", "harman",
+]
+AUTOMOTIVE_INDUSTRY = re.compile(r"automotive|motor vehicle|auto parts", re.I)
+AUTO_DESC = re.compile(r"\b(automotive|passenger vehicle|oem vehicle|light[- ]duty|powertrain)\b", re.I)
+
+# State preference (bonus, not a filter). Colorado + neighbours, FL, NC, SC, TX.
+PREFERRED_STATES = {
+    "colorado": 3, "texas": 3, "florida": 3, "north carolina": 3, "south carolina": 3,
+    "wyoming": 2, "nebraska": 2, "kansas": 2, "oklahoma": 2, "new mexico": 2,
+    "utah": 2, "arizona": 1,
+}
 
 MIN_SALARY = 120_000   # soft floor: unlisted pay is kept; listed max below this is dropped
 EXCLUDE_STATES = ("california",)          # lowercase full names
@@ -131,6 +163,13 @@ def evaluate(row):
     if SENIORITY_EXCLUDE.search(str(row.get("seniority_level") or "")):
         return False, 0, ["seniority too high"]
 
+    # Automotive: hard exclude by employer / industry; soften on heavy description use.
+    ind = row.get("company_industry")
+    ind = " ".join(map(str, ind)) if isinstance(ind, list) else str(ind or "")
+    if any(c in company + " " for c in AUTOMOTIVE_COMPANIES) or AUTOMOTIVE_INDUSTRY.search(ind):
+        return False, 0, ["automotive"]
+    auto_hits = len(AUTO_DESC.findall(desc))
+
     # Location: drop only if every listed location is California.
     locs = loc_list(row.get("locations"))
     wt = str(row.get("workplace_type") or "")
@@ -175,6 +214,14 @@ def evaluate(row):
         notes.append("no salary listed")
     if "remote" in wt.lower():
         score += 1
+    locblob = " ".join(locs).lower()
+    best = max([pts for st, pts in PREFERRED_STATES.items() if st in locblob], default=0)
+    if best:
+        score += best
+        notes.append("preferred state")
+    if auto_hits >= 3:
+        score -= 3
+        notes.append("automotive-heavy description")
     return True, score, notes
 
 
@@ -229,6 +276,8 @@ def selftest():
         ("keeps ability to obtain", dict(title="Aerospace Engineer", locations=["Texas"], description_md="Must be able to obtain a Secret clearance; active clearance not required... ability to obtain a clearance."), True),
         ("keeps US-citizen-only", dict(title="Aerospace Engineer", locations=["Texas"], description_md="Must be a U.S. citizen (ITAR)."), True),
         ("drops 8+ years", dict(title="Mechanical Engineer", locations=["Texas"], description_md="8+ years of experience required."), False),
+        ("drops GM", dict(title="Turbocharger Engineer", company_name="General Motors", locations=["Michigan"]), False),
+        ("drops auto industry", dict(title="Mechanical Engineer", company_industry=["Automotive"], locations=["Ohio"]), False),
         ("drops intern", dict(title="Mechanical Engineering Intern", locations=["Texas"]), False),
     ]
     bad = 0
