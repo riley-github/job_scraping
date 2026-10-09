@@ -75,7 +75,8 @@ COMPANY_BONUS = [
 # Titles to drop: too senior, or not a job-search target.
 TITLE_EXCLUDE = re.compile(
     r"\b(senior|sr\.?|staff|principal|lead|manager|director|head of|vp|chief|"
-    r"intern|internship|co-op|coop|apprentice|technician|mechanic|sales|"
+    r"supervisory|intern|internship|co-op|coop|apprentice|technician|mechanic|sales|drafter|"
+    r"drafting|advisor|nurse|nursing|surveyor|survey|teacher|instructor|"
     r"field service)\b", re.I)
 SENIORITY_EXCLUDE = re.compile(r"senior|executive|director|lead|manager", re.I)
 
@@ -111,6 +112,7 @@ PREFERRED_STATES = {
     "utah": 2, "arizona": 1,
 }
 
+MIN_RELEVANCE = 3   # title+description fit required before bonuses count
 MIN_SALARY = 120_000   # soft floor: unlisted pay is kept; listed max below this is dropped
 EXCLUDE_STATES = ("california",)          # lowercase full names
 EXCLUDE_STATE_ABBR = ("CA",)
@@ -118,23 +120,68 @@ EXCLUDE_STATE_ABBR = ("CA",)
 # ----------------------------------------------------------------------------
 
 
-def fetch(page_size=1000, max_rows=20000):
-    ors = ",".join(f"title.ilike.*{urllib.parse.quote(t)}*" for t in TITLE_QUERY)
-    base = f"{SUPABASE_URL}?select=*&or=({ors})&order=scraped_at.desc"
-    rows, start = [], 0
-    while start < max_rows:
-        req = urllib.request.Request(base, headers={
-            "apikey": ANON_KEY, "Authorization": f"Bearer {ANON_KEY}",
-            "Range-Unit": "items", "Range": f"{start}-{start + page_size - 1}",
-        })
-        with urllib.request.urlopen(req, timeout=60) as r:
-            batch = json.load(r)
-        rows += batch
-        print(f"fetched {len(rows)} rows", file=sys.stderr)
-        if len(batch) < page_size:
+LIGHT = ("primary_key,title,company_name,locations,workplace_type,seniority_level,"
+         "commitment,salary_min_yearly,salary_max_yearly,company_industry,apply_url,scraped_at")
+
+# Title must contain one of these as a whole word (server-side ilike would match
+# "cad" inside "Academic" and times out on rare terms, so we scan and filter here).
+TITLE_RE = re.compile(r"\b(" + "|".join(re.escape(t) for t in TITLE_QUERY) + r")", re.I)
+
+
+def _get(url, tries=4):
+    import time
+    for i in range(tries):
+        req = urllib.request.Request(url, headers={
+            "apikey": ANON_KEY, "Authorization": f"Bearer {ANON_KEY}"})
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.load(r)
+        except Exception as e:
+            if i == tries - 1:
+                print(f"giving up on {url[:120]}: {e}", file=sys.stderr)
+                return []
+            time.sleep(2 ** i)
+
+
+def fetch(max_rows=3_000_000, cache="candidates.json"):
+    """Keyset-scan the whole table on the primary key (fast, index-ordered),
+    keep rows with a relevant title, then fetch descriptions for those only."""
+    import os
+    if cache and os.path.exists(cache):
+        print(f"using cached {cache} (delete it to re-scan)", file=sys.stderr)
+        return json.load(open(cache))
+    cands, last, scanned = [], None, 0
+    while scanned < max_rows:
+        url = f"{SUPABASE_URL}?select={LIGHT}&order=primary_key&limit=1000"
+        if last:
+            url += "&primary_key=gt." + urllib.parse.quote(last, safe="")
+        batch = _get(url)
+        if not batch:
             break
-        start += page_size
-    return rows
+        scanned += len(batch)
+        last = batch[-1]["primary_key"]
+        for r in batch:
+            t = r.get("title") or ""
+            if TITLE_RE.search(t) and not TITLE_EXCLUDE.search(t):
+                cands.append(r)
+        if scanned % 100000 < 1000:
+            print(f"scanned {scanned}, candidates {len(cands)}", file=sys.stderr)
+        if len(batch) < 1000:
+            break
+    print(f"scanned {scanned}; {len(cands)} title candidates; fetching descriptions", file=sys.stderr)
+    for i in range(0, len(cands), 25):
+        chunk = cands[i:i + 25]
+        keys = ",".join('"' + c["primary_key"].replace('"', '\\"') + '"' for c in chunk)
+        url = (f"{SUPABASE_URL}?select=primary_key,description_md"
+               f"&primary_key=in.({urllib.parse.quote(keys)})")
+        descs = {d["primary_key"]: d["description_md"] for d in _get(url)}
+        for c in chunk:
+            c["description_md"] = descs.get(c["primary_key"], "")
+        if (i // 25) % 20 == 0:
+            print(f"descriptions {i}/{len(cands)}", file=sys.stderr)
+    if cache:
+        json.dump(cands, open(cache, "w"))
+    return cands
 
 
 def loc_list(v):
@@ -192,7 +239,7 @@ def evaluate(row):
         notes.append("citizenship/clearance mentioned")
 
     # Experience requirement above range.
-    yrs = [int(y) for y in YEARS_RE.findall(desc)]
+    yrs = [y for y in (int(v) for v in YEARS_RE.findall(desc)) if y <= 15]
     if yrs and min(yrs) > MAX_YEARS_REQUIRED:
         return False, 0, [f"asks {min(yrs)}+ yrs"]
 
@@ -204,6 +251,7 @@ def evaluate(row):
     for pat, pts in DESC_SCORES.items():
         if re.search(pat, desc, re.I):
             score += pts
+    relevance = score
     if any(c in company for c in COMPANY_BONUS):
         score += 2
         notes.append("target employer")
@@ -222,21 +270,25 @@ def evaluate(row):
     if auto_hits >= 3:
         score -= 3
         notes.append("automotive-heavy description")
-    return True, score, notes
+    return True, (score if relevance >= MIN_RELEVANCE else 0), notes
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="jobs_ranked.csv")
     ap.add_argument("--min-score", type=int, default=3)
-    ap.add_argument("--max-rows", type=int, default=20000)
+    ap.add_argument("--max-rows", type=int, default=3_000_000)
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
 
-    kept, dropped = [], {}
+    kept, dropped, seen_keys = [], {}, set()
     for row in fetch(max_rows=a.max_rows):
+        dk = (row.get("title"), row.get("company_name"), str(row.get("locations")))
+        if dk in seen_keys:
+            continue
+        seen_keys.add(dk)
         ok, score, notes = evaluate(row)
         if not ok:
             dropped[notes[0]] = dropped.get(notes[0], 0) + 1
