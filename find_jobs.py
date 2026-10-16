@@ -11,6 +11,7 @@ Edit the CONFIG block to tune. Stdlib only.
 """
 import argparse
 import csv
+import html
 import json
 import re
 import sys
@@ -309,7 +310,7 @@ def main():
                         "; ".join(loc_list(r.get("locations"))), r.get("workplace_type"),
                         r.get("seniority_level"), r.get("commitment"),
                         r.get("salary_min_yearly"), r.get("salary_max_yearly"),
-                        ", ".join(notes), r.get("apply_url")])
+                        ", ".join(notes), html.unescape(r.get("apply_url") or "")])
     print(f"\nkept {len(kept)} -> {a.out}\ndropped: {dropped}", file=sys.stderr)
 
 
